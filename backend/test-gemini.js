@@ -19,6 +19,9 @@ geminiWs.on('open', () => {
             },
             generationConfig: {
                 responseModalities: ["AUDIO"],
+            // encourage faster response
+                maxOutputTokens: 120,
+                temperature: 0.6,
                 speechConfig: {
                     voiceConfig: {
                         prebuiltVoiceConfig: {
@@ -33,7 +36,21 @@ geminiWs.on('open', () => {
 });
 
 geminiWs.on('message', (data) => {
-    console.log("Message:", data.toString());
+
+  const message = data.toString();
+
+  if (message.includes("setupComplete")) {
+    console.log("Gemini ready");
+  }
+
+  if (message.includes("error")) {
+    console.log("Gemini error:", message);
+  }
+
+  if (clientWs.readyState === WebSocket.OPEN) {
+    clientWs.send(message);
+  }
+
 });
 
 geminiWs.on('close', (code, reason) => {
