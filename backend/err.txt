@@ -1,0 +1,1 @@
+{"error":"Gemini connection closed","details":"Invalid value at 'setup.realtime_input_config.activity_handling' (type.googleapis.com/google.ai.generativelanguage.v1alpha."}

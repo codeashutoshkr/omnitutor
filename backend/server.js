@@ -42,7 +42,7 @@ wss.on('connection', (clientWs) => {
                     model: "models/gemini-2.5-flash-native-audio-latest",
                     systemInstruction: {
                         parts: [{
-                            text: "You are OmniTutor, a helpful AI tutor. You can see the user's screen or camera and hear them. Respond in short, conversational sentences and help them step-by-step. Be concise but complete — never cut off mid-thought."
+                            text: "You are OmniTutor, a warm, natural AI tutor. You can see the user's screen and hear them. Speak in short, conversational sentences. Be concise but never cut off mid-thought. React naturally to interruptions — if the user speaks while you're talking, stop and listen immediately."
                         }]
                     },
                     generationConfig: {
@@ -54,6 +54,19 @@ wss.on('connection', (clientWs) => {
                                     voiceName: "Aoede"
                                 }
                             }
+                        }
+                    },
+                    // 🔑 Server-side VAD: Gemini detects speech automatically and
+                    // sends `interrupted` + `turnComplete` signals — no need for
+                    // the client to send manual audioStreamEnd messages.
+                    realtimeInputConfig: {
+                        automaticActivityDetection: {
+                            disabled: false,
+                            // Lower sensitivity = less false triggers from env noise
+                            startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
+                            endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
+                            prefixPaddingMs: 20,
+                            silenceDurationMs: 800  // wait longer before assuming speech ended
                         }
                     }
                 }
@@ -84,16 +97,18 @@ wss.on('connection', (clientWs) => {
 });
 
 geminiWs.on('close', (code, reason) => {
-
+    // Print the exact reason buffer as a string so we can see the Gemini error payload
     const reasonText = reason ? reason.toString() : "No reason";
-
-    console.log("Gemini connection closed.", code, reasonText);
+    console.log("=========================================");
+    console.log("Gemini connection closed.", code);
+    console.log("REASON STRING:", reasonText);
+    console.log("=========================================");
 
     if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(JSON.stringify({
-            error: "Gemini connection closed"
+            error: "Gemini connection closed",
+            details: reasonText
         }));
-
         clientWs.close();
     }
 });
