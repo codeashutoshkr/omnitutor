@@ -4,6 +4,14 @@ const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
 
+// Safely require cloud service in case it is missing in the environment
+let cloudService;
+try {
+    cloudService = require('./cloud');
+} catch (e) {
+    console.warn("⚠️ cloud.js not found. Snapshot upload endpoints will fail gracefully.");
+}
+
 const app = express();
 const port = process.env.PORT || 5000;
 app.use(cors());
@@ -11,7 +19,6 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // The endpoint for the Gemini Live API
@@ -36,18 +43,18 @@ wss.on('connection', (clientWs) => {
         geminiWs.on('open', () => {
             console.log("Connected to Gemini Live API");
 
-            // Send initial setup message (optional but good for defining instructions)
+            // Fixed nested structure and formatting for the setup payload
             const setupMessage = {
                 setup: {
                     model: "models/gemini-2.5-flash-native-audio-latest",
                     systemInstruction: {
                         parts: [{
-                            text: "You are OmniTutor, a warm, natural AI tutor. You can see the user's screen and hear them. Speak in short, conversational sentences. Be concise but never cut off mid-thought. React naturally to interruptions — if the user speaks while you're talking, stop and listen immediately."
+                            text: `You are Omnitutor, a helpful AI tutor. You can see the user's screen and hear them. Be concise (1-2 sentences) to keep latency low. React naturally to interruptions — if the user speaks while you're talking, stop and listen immediately.`
                         }]
                     },
                     generationConfig: {
                         responseModalities: ["AUDIO"],
-                        temperature: 0.7,
+                        temperature: 0.6, // Slightly lower for more consistent tutoring logic
                         speechConfig: {
                             voiceConfig: {
                                 prebuiltVoiceConfig: {
@@ -55,73 +62,59 @@ wss.on('connection', (clientWs) => {
                                 }
                             }
                         }
-                    },
-                    // 🔑 Server-side VAD: Gemini detects speech automatically and
-                    // sends `interrupted` + `turnComplete` signals — no need for
-                    // the client to send manual audioStreamEnd messages.
-                    realtimeInputConfig: {
-                        automaticActivityDetection: {
-                            disabled: false,
-                            // Lower sensitivity = less false triggers from env noise
-                            startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
-                            endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
-                            prefixPaddingMs: 20,
-                            silenceDurationMs: 800  // wait longer before assuming speech ended
-                        }
                     }
                 }
             };
+            
             if (geminiWs.readyState === WebSocket.OPEN) {
                  geminiWs.send(JSON.stringify(setupMessage));
-}
+            }
         });
 
-    let setupLogged = false;
+        let setupLogged = false;
 
         geminiWs.on("message", (data) => {
-
-          if (!setupLogged) {
-            try {
-            const msg = JSON.parse(data.toString());
-            if (msg.setupComplete) {
-                console.log("Gemini setup completed");
-                setupLogged = true;
+            if (!setupLogged) {
+                try {
+                    const msg = JSON.parse(data.toString());
+                    if (msg.setupComplete) {
+                        console.log("Gemini setup completed");
+                        setupLogged = true;
+                    }
+                } catch (e) {}
             }
-        }   catch {}
-    }
 
-    if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(data.toString());
-    }
+            if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(data.toString());
+            }
+        });
 
-});
+        geminiWs.on('close', (code, reason) => {
+            // Print the exact reason buffer as a string so we can see the Gemini error payload
+            const reasonText = reason ? reason.toString() : "No reason";
+            console.log("=========================================");
+            console.log("Gemini connection closed.", code);
+            console.log("REASON STRING:", reasonText);
+            console.log("=========================================");
 
-geminiWs.on('close', (code, reason) => {
-    // Print the exact reason buffer as a string so we can see the Gemini error payload
-    const reasonText = reason ? reason.toString() : "No reason";
-    console.log("=========================================");
-    console.log("Gemini connection closed.", code);
-    console.log("REASON STRING:", reasonText);
-    console.log("=========================================");
+            if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({
+                    error: "Gemini connection closed",
+                    details: reasonText
+                }));
+                clientWs.close();
+            }
+        });
 
-    if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({
-            error: "Gemini connection closed",
-            details: reasonText
-        }));
-        clientWs.close();
-    }
-});
+        geminiWs.on('error', (err) => {
+            console.error("Gemini WS Error:", err);
 
-       geminiWs.on('error', (err) => {
-         console.error("Gemini WS Error:", err);
-
-       if (clientWs.readyState === WebSocket.OPEN) {
-         clientWs.send(JSON.stringify({
-         error: "Error communicating with Gemini."
-        }));
-    }
-});
+            if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({
+                    error: "Error communicating with Gemini."
+                }));
+            }
+        });
 
     } catch (e) {
         console.error("Failed to connect to Gemini", e);
@@ -131,7 +124,9 @@ geminiWs.on('close', (code, reason) => {
     clientWs.on('message', (message) => {
         try {
             if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
-                geminiWs.send(message);
+                // OPTIMIZATION: Ensure message is converted to string. 
+                // The 'ws' library receives Buffers by default. Passing raw buffers to Gemini's JSON endpoint can cause drops.
+                geminiWs.send(message.toString());
             }
         } catch (e) {
             console.error("Error forwarding message to Gemini:", e);
@@ -146,8 +141,6 @@ geminiWs.on('close', (code, reason) => {
     });
 });
 
-const cloudService = require('./cloud');
-
 app.get('/api/status', (req, res) => {
     res.json({ status: "OmniTutor proxy is running", geminiKeySet: !!GEMINI_API_KEY });
 });
@@ -158,6 +151,9 @@ app.post('/api/snapshot', async (req, res) => {
     if (!imageBase64) return res.status(400).json({ error: "Missing imageBase64" });
 
     try {
+        if (!cloudService) {
+            return res.status(500).json({ error: "Cloud service not configured." });
+        }
         const publicUrl = await cloudService.uploadSnapshot(imageBase64, sessionId);
         res.json({ success: true, url: publicUrl });
     } catch (err) {

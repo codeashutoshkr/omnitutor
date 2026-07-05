@@ -8,7 +8,8 @@ export function useOmniTutor() {
   const [userSpeaking, setUserSpeaking] = useState(false);
 
   const wsRef = useRef(null);
-  const audioContextRef = useRef(null);
+  const playbackAudioContextRef = useRef(null);
+  const recordingAudioContextRef = useRef(null);
   const mediaStreamRef = useRef(null);
   const audioStreamRef = useRef(null);
   const workletLoadedRef = useRef(false);
@@ -16,15 +17,25 @@ export function useOmniTutor() {
   const canvasRef = useRef(null);
   const frameIntervalRef = useRef(null);
   const nextPlaybackTimeRef = useRef(0);
-  const scheduledSourcesRef = useRef([]);  // track all scheduled audio sources
-  const agentSpeakingRef = useRef(false); // sync ref for audio callbacks
+  const scheduledSourcesRef = useRef([]);  
+  const agentSpeakingRef = useRef(false); 
   const userSpeakingRef = useRef(false);
+
+  // Helper: High-performance Uint8Array to Base64 conversion
+  const arrayBufferToBase64 = (buffer) => {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+  };
 
   // ─── Stop all agent audio immediately ─────────────────────────────────────
   const stopAgentAudio = useCallback(() => {
-    // Cancel every scheduled audio source
     scheduledSourcesRef.current.forEach(src => {
-      try { src.stop(); } catch { /* already stopped */ }
+      try { src.stop(); } catch { /* already stopped or finished */ }
     });
     scheduledSourcesRef.current = [];
     nextPlaybackTimeRef.current = 0;
@@ -36,17 +47,20 @@ export function useOmniTutor() {
   const connect = useCallback(() => {
     if (wsRef.current) return;
 
+    // Connect to your backend proxy architecture
     wsRef.current = new WebSocket('ws://localhost:5000');
 
     wsRef.current.onopen = () => {
       console.log('Connected to backend proxy');
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
+      
+      // Separate Playback context locked to Gemini's native 24kHz output
+      if (!playbackAudioContextRef.current) {
+        playbackAudioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: 24000
         });
       }
-      if (audioContextRef.current?.state === 'suspended') {
-        audioContextRef.current.resume();
+      if (playbackAudioContextRef.current?.state === 'suspended') {
+        playbackAudioContextRef.current.resume();
       }
       setIsConnected(true);
     };
@@ -60,14 +74,14 @@ export function useOmniTutor() {
       let response;
       try { response = JSON.parse(text); } catch { return; }
 
-      // ── 1. Interrupted signal: user spoke → cancel agent audio immediately
+      // 1. Interrupted signal from Server VAD
       if (response.serverContent?.interrupted) {
         console.log('🛑 Gemini interrupted — stopping agent audio');
         stopAgentAudio();
         return;
       }
 
-      // ── 2. Turn complete: AI finished its response
+      // 2. Turn complete
       if (response.serverContent?.turnComplete) {
         console.log('✅ Gemini turn complete');
         agentSpeakingRef.current = false;
@@ -75,13 +89,11 @@ export function useOmniTutor() {
         return;
       }
 
-      // ── 3. Audio parts: stream and schedule audio chunks
+      // 3. Playback incoming streaming audio blocks
       if (response.serverContent?.modelTurn?.parts) {
         const parts = response.serverContent.modelTurn.parts;
-
         for (const part of parts) {
           if (part.inlineData?.data) {
-            // Mark agent as speaking on first audio chunk
             if (!agentSpeakingRef.current) {
               agentSpeakingRef.current = true;
               setAgentSpeaking(true);
@@ -90,7 +102,6 @@ export function useOmniTutor() {
           }
         }
       }
-
     };
 
     wsRef.current.onclose = () => {
@@ -119,29 +130,29 @@ export function useOmniTutor() {
     return () => { disconnect(); };
   }, [disconnect]);
 
-  // ─── Stop screen / mic streams ─────────────────────────────────────────────
   const stopMediaStreams = () => {
     if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
     if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop());
     if (audioStreamRef.current) audioStreamRef.current.getTracks().forEach(t => t.stop());
+    
+    if (recordingAudioContextRef.current) {
+      recordingAudioContextRef.current.close().catch(() => {});
+      recordingAudioContextRef.current = null;
+    }
+    
+    workletLoadedRef.current = false;
     setIsMicActive(false);
     setIsScreenSharing(false);
     setUserSpeaking(false);
   };
 
-  // ─── PCM audio playback (seamlessly scheduled) ────────────────────────────
+  // ─── PCM 24kHz Audio Playback Output ──────────────────────────────────────
   const playAudioChunk = (base64Audio) => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 24000
-      });
-    }
+    const audioCtx = playbackAudioContextRef.current;
+    if (!audioCtx) return;
+    if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
 
-    const audioCtx = audioContextRef.current;
-    if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => { });
-
-    // Decode base64 → PCM16 → Float32
-    const binary = atob(base64Audio);
+    const binary = window.atob(base64Audio);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
@@ -156,21 +167,19 @@ export function useOmniTutor() {
     source.buffer = buffer;
     source.connect(audioCtx.destination);
 
-    // Track source so we can cancel it on interrupt
     scheduledSourcesRef.current.push(source);
     source.onended = () => {
       scheduledSourcesRef.current = scheduledSourcesRef.current.filter(s => s !== source);
     };
 
-    // Seamless gapless scheduling
     const now = audioCtx.currentTime;
     if (nextPlaybackTimeRef.current < now) nextPlaybackTimeRef.current = now;
-    const scheduleAt = Math.max(nextPlaybackTimeRef.current, now + 0.02);
+    const scheduleAt = Math.max(nextPlaybackTimeRef.current, now + 0.01); // Reduced scheduling pad
     source.start(scheduleAt);
     nextPlaybackTimeRef.current = scheduleAt + buffer.duration;
   };
 
-  // ─── Microphone ────────────────────────────────────────────────────────────
+  // ─── Microphone Streaming ──────────────────────────────────────────────────
   const startMic = async () => {
     try {
       if (isMicActive) return;
@@ -183,39 +192,39 @@ export function useOmniTutor() {
       audioStreamRef.current = stream;
       setIsMicActive(true);
 
-      const audioContext = audioContextRef.current || new AudioContext({ sampleRate: 24000 });
-      audioContextRef.current = audioContext;
-      if (audioContext.state === 'suspended') await audioContext.resume();
+      // CRITICAL FIX: Lock recording context strictly to 16000Hz to match the Gemini model input API requirement
+      const recordingContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      recordingAudioContextRef.current = recordingContext;
 
       if (!workletLoadedRef.current) {
-        await audioContext.audioWorklet.addModule('/mic-processor.js');
+        await recordingContext.audioWorklet.addModule('/mic-processor.js');
         workletLoadedRef.current = true;
       }
 
-      const source = audioContext.createMediaStreamSource(stream);
-      const workletNode = new AudioWorkletNode(audioContext, 'mic-processor');
+      const source = recordingContext.createMediaStreamSource(stream);
+      const workletNode = new AudioWorkletNode(recordingContext, 'mic-processor');
 
-      // Silent output (we don't want to hear ourselves)
-      const silentGain = audioContext.createGain();
+      const silentGain = recordingContext.createGain();
       silentGain.gain.value = 0;
       source.connect(workletNode);
       workletNode.connect(silentGain);
-      silentGain.connect(audioContext.destination);
+      silentGain.connect(recordingContext.destination);
 
       workletNode.port.onmessage = (event) => {
         const input = event.data;
-
-        // ── Barge-in detection: if user speaks while agent is talking, stop agent
         const isSpeaking = input.some(v => Math.abs(v) > 0.04);
 
+        // Client-Side Interruption (Barge-In)
         if (isSpeaking && !userSpeakingRef.current) {
           userSpeakingRef.current = true;
           setUserSpeaking(true);
 
-          // If agent was speaking, stop it immediately (local barge-in)
           if (agentSpeakingRef.current) {
-            console.log('🎤 User barged in — stopping agent audio locally');
+            console.log('🎤 User barged in — killing local playback tracks');
             stopAgentAudio();
+            
+            // Send client side cancellation request over the WebSocket if proxy supports it
+            wsRef.current.send(JSON.stringify({ clientContent: { turnComplete: false, interrupted: true } }));
           }
         }
 
@@ -224,28 +233,21 @@ export function useOmniTutor() {
           setUserSpeaking(false);
         }
 
-        // ── Noise gate: compute RMS energy; if below floor send silence
-        // This prevents ambient noise / breathing from triggering Gemini's VAD
-        const NOISE_FLOOR = 0.03; // tune: lower = more sensitive, higher = stricter
+        // Noise gate floor optimization
+        const NOISE_FLOOR = 0.03;
         let rms = 0;
         for (let i = 0; i < input.length; i++) rms += input[i] * input[i];
         rms = Math.sqrt(rms / input.length);
-        const gatedInput = rms > NOISE_FLOOR ? input : new Float32Array(input.length); // zeros if silent
+        const gatedInput = rms > NOISE_FLOOR ? input : new Float32Array(input.length);
 
-        // ── Stream raw PCM to backend → Gemini (always, no silence gating)
-        // Gemini's server-side VAD decides when the user has finished speaking.
+        // Fast Float32 to Int16 Conversion
         const pcm16 = new Int16Array(gatedInput.length);
         for (let i = 0; i < gatedInput.length; i++) {
           pcm16[i] = Math.max(-1, Math.min(1, gatedInput[i])) * 32767;
         }
 
-        const uint8 = new Uint8Array(pcm16.buffer);
-        let binary = '';
-        const chunkSize = 0x6000; // 24 KB
-        for (let i = 0; i < uint8.length; i += chunkSize) {
-          binary += String.fromCharCode(...uint8.subarray(i, i + chunkSize));
-        }
-        const base64 = btoa(binary);
+        // Fast allocation-free Base64 conversion
+        const base64 = arrayBufferToBase64(pcm16.buffer);
 
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({
@@ -256,17 +258,17 @@ export function useOmniTutor() {
         }
       };
 
-      console.log('Microphone streaming started (continuous — server VAD active)');
+      console.log('Microphone streaming successfully initialized at 16kHz.');
     } catch (err) {
       console.error('Failed to start mic:', err);
     }
   };
 
-  // ─── Screen share ──────────────────────────────────────────────────────────
+  // ─── Screen Sharing with Downscaled Dimensions ─────────────────────────────
   const startScreenShare = async () => {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 10 } }
+        video: { frameRate: { ideal: 5 } } // Throttled native frame collection rate
       });
 
       stream.getVideoTracks()[0].onended = () => { stopMediaStreams(); };
@@ -280,7 +282,8 @@ export function useOmniTutor() {
         if (!canvasRef.current) {
           canvasRef.current = document.createElement('canvas');
         }
-        // Send a frame every second
+
+        // Poll frames down to a balanced 1 frame per second to protect token window
         frameIntervalRef.current = setInterval(() => {
           captureAndSendFrame();
         }, 1000);
@@ -295,13 +298,32 @@ export function useOmniTutor() {
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
+    
     if (video.videoWidth > 0 && video.videoHeight > 0) {
+      // OPTIMIZATION: Downscale image frame boundaries down to ~768px box to save network + engine processing latency
+      const MAX_DIMENSION = 768;
+      let targetWidth = video.videoWidth;
+      let targetHeight = video.videoHeight;
+
+      if (targetWidth > MAX_DIMENSION || targetHeight > MAX_DIMENSION) {
+        if (targetWidth > targetHeight) {
+          targetHeight = Math.round((targetHeight * MAX_DIMENSION) / targetWidth);
+          targetWidth = MAX_DIMENSION;
+        } else {
+          targetWidth = Math.round((targetWidth * MAX_DIMENSION) / targetHeight);
+          targetHeight = MAX_DIMENSION;
+        }
+      }
+
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+
       const ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const base64Img = canvas.toDataURL('image/jpeg', 0.15).split(',')[1];
+      ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+      
+      // Extract compressed visual chunk string data
+      const base64Img = canvas.toDataURL('image/jpeg', 0.2).split(',')[1];
+      
       wsRef.current.send(JSON.stringify({
         realtimeInput: { mediaChunks: [{ mimeType: 'image/jpeg', data: base64Img }] }
       }));
