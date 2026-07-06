@@ -1,37 +1,42 @@
-// MicProcessor: runs in the AudioWorklet context at sampleRate = 24000 Hz.
-// Gemini Live API expects PCM audio at 16000 Hz, so we downsample 3:2
-// using a simple linear interpolation before posting to the main thread.
+// MicProcessor: runs in the AudioWorklet context at sampleRate = 16kHz.
+// The AudioContext is already created at 16kHz — NO downsampling needed.
+//
+// Buffer size: 2048 samples = 128ms per chunk @ 16kHz.
+// This halves the previous 256ms delay, meaning the last words you say
+// before stopping reach Gemini ~128ms sooner, making turn detection faster.
+// Still sends only ~8 packets/sec — far better than the original 125/sec.
 
 class MicProcessor extends AudioWorkletProcessor {
 
   constructor() {
     super();
-    this._buffer = [];
-    this._ratio = 16000 / 24000; // target / source = 0.6667
+    this._buffer = new Float32Array(2048);
+    this._writePos = 0;
+    this._SEND_SIZE = 2048; // 128ms of audio @ 16kHz
   }
 
   process(inputs) {
     const input = inputs[0];
+    if (!input || input.length === 0) return true;
 
-    if (input.length > 0) {
-      const channelData = input[0]; // Float32Array at 24000 Hz
+    const channelData = input[0]; // Float32Array @ 16000 Hz — correct, no downsample
+    const inLen = channelData.length;
 
-      // Downsample to 16000 Hz via linear interpolation
-      const inputLen = channelData.length;
-      const outputLen = Math.round(inputLen * this._ratio);
-      const downsampled = new Float32Array(outputLen);
+    let srcOffset = 0;
+    while (srcOffset < inLen) {
+      const remaining = inLen - srcOffset;
+      const space = this._SEND_SIZE - this._writePos;
+      const toCopy = Math.min(remaining, space);
 
-      for (let i = 0; i < outputLen; i++) {
-        // Map output index back to a (possibly fractional) input index
-        const srcIdx = i / this._ratio;
-        const srcFloor = Math.floor(srcIdx);
-        const srcCeil = Math.min(srcFloor + 1, inputLen - 1);
-        const frac = srcIdx - srcFloor;
-        downsampled[i] = channelData[srcFloor] * (1 - frac) + channelData[srcCeil] * frac;
+      this._buffer.set(channelData.subarray(srcOffset, srcOffset + toCopy), this._writePos);
+      this._writePos += toCopy;
+      srcOffset += toCopy;
+
+      if (this._writePos >= this._SEND_SIZE) {
+        // Post a copy (not the same buffer reference) to avoid data races
+        this.port.postMessage(this._buffer.slice(0));
+        this._writePos = 0;
       }
-
-      // Post the 16000 Hz Float32 data back to the main thread
-      this.port.postMessage(downsampled);
     }
 
     return true;
