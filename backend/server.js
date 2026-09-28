@@ -47,27 +47,21 @@ const GEMINI_SETUP_MESSAGE = {
                 text: `You are OmniTutor, a friendly expert tutor for students of all levels. You speak through live voice and can see the student's screen in real time.
 
 TEACHING STYLE:
-- Give a SHORT direct answer first (1-2 sentences), then offer to go deeper: "Want me to explain further?"
-- Adapt to any subject or question length — simple factual answers to complex multi-step explanations.
-- Use clear analogies and real-world examples. Avoid jargon unless the student uses it first.
-- Guide students to think through problems themselves rather than just handing them answers.
-- Be warm and encouraging — learning is hard, praise effort and progress.
-- If the student is confused, slow down and break the problem into smaller steps.
+- Give a SHORT direct answer first (1-2 sentences), then offer to go deeper.
+- Use clear analogies and real-world examples.
+- Be warm and encouraging.
 
 SCREEN AWARENESS:
-- When you see their screen, proactively comment: "I can see you're working on [topic]..."
-- Spot and mention errors naturally: "I noticed on line X there might be an issue with..."
-- If no screen is shared, encourage them to share it for better help.
+- When you see their screen, comment on what they're working on.
+- Spot errors naturally.
 
 CONVERSATION:
-- Keep responses concise unless the student explicitly asks for a full explanation.
-- React naturally to interruptions — stop immediately if the student speaks.
-- Match your pace to the student — faster for quick questions, slower for complex topics.`
+- Keep responses concise unless asked for a full explanation.
+- React naturally to interruptions — stop immediately if the student speaks.`
             }]
         },
         generationConfig: {
             responseModalities: ["AUDIO"],
-            temperature: 0.6,
             speechConfig: {
                 voiceConfig: {
                     prebuiltVoiceConfig: {
@@ -75,17 +69,10 @@ CONVERSATION:
                     }
                 }
             }
-        },
-        // ── Manual Turn Detection (client-driven) ──────────────────────────
-        // Server-side VAD disabled. The frontend hook (useOmniTutor.js) sends:
-        //   { realtimeInput: { activityStart: {} } } — when user starts speaking
-        //   { realtimeInput: { activityEnd: {} } }   — after 600ms of silence
-        // Gemini responds immediately on activityEnd — no 1000ms server wait.
-        realtimeInputConfig: {
-            automaticActivityDetection: {
-                disabled: true
-            }
         }
+        // NOTE: No realtimeInputConfig override — using Gemini's built-in VAD.
+        // This is the most reliable mode. Gemini detects speech and silence
+        // automatically and responds when the user finishes speaking.
     }
 };
 
@@ -110,82 +97,87 @@ wss.on('connection', (clientWs) => {
 
         geminiWs.on('open', () => {
             console.log("✅ Connected to Gemini Live API");
-            geminiWs.send(JSON.stringify(GEMINI_SETUP_MESSAGE));
+            const setupMsg = JSON.stringify(GEMINI_SETUP_MESSAGE);
+            console.log("📤 Sending setup to Gemini:", setupMsg.substring(0, 200) + "...");
+            geminiWs.send(setupMsg);
 
-            // Keepalive ping every 20s — prevents idle WebSocket timeout
             keepaliveTimer = setInterval(() => {
                 if (geminiWs.readyState === WebSocket.OPEN) {
-                    try {
-                        geminiWs.ping();
-                    } catch (e) {
-                        console.warn('Keepalive ping failed:', e.message);
-                    }
+                    try { geminiWs.ping(); } catch (e) { console.warn('Keepalive ping failed:', e.message); }
                 }
             }, KEEPALIVE_INTERVAL_MS);
         });
 
-        let setupLogged = false;
-
         geminiWs.on("message", (data) => {
-            if (!setupLogged) {
-                try {
-                    const msg = JSON.parse(data.toString());
-                    if (msg.setupComplete) {
-                        console.log("🎓 Gemini OmniTutor session ready (manual turn detection active)");
-                        setupLogged = true;
+            const text = data.toString();
+            try {
+                const msg = JSON.parse(text);
+
+                if (msg.setupComplete) {
+                    console.log("🎓 Gemini session ready — automatic VAD active");
+                } else if (msg.error) {
+                    // This is critical — log full error details
+                    console.error("❌ GEMINI ERROR:", JSON.stringify(msg.error, null, 2));
+                } else if (msg.serverContent) {
+                    if (msg.serverContent.turnComplete) {
+                        console.log("✅ Gemini finished speaking (turnComplete)");
+                    } else if (msg.serverContent.interrupted) {
+                        console.log("🛑 Gemini interrupted");
+                    } else if (msg.serverContent.modelTurn?.parts) {
+                        console.log("🔊 Gemini audio chunk received");
                     }
-                } catch (e) {}
+                }
+            } catch (e) {
+                // Binary or non-JSON — ignore
             }
 
             if (clientWs.readyState === WebSocket.OPEN) {
-                clientWs.send(data.toString());
+                clientWs.send(text);
             }
         });
 
         geminiWs.on('close', (code, reason) => {
             const reasonText = reason ? reason.toString() : "No reason provided";
             console.log("=========================================");
-            console.log(`Gemini connection closed. Code: ${code}`);
+            console.log(`❌ Gemini connection closed. Code: ${code}`);
             console.log("Reason:", reasonText);
             console.log("=========================================");
             cleanup();
 
             if (clientWs.readyState === WebSocket.OPEN) {
-                clientWs.send(JSON.stringify({
-                    error: "Gemini connection closed",
-                    code,
-                    details: reasonText
-                }));
+                clientWs.send(JSON.stringify({ error: "Gemini connection closed", code, details: reasonText }));
                 clientWs.close();
             }
         });
 
         geminiWs.on('error', (err) => {
-            console.error("Gemini WS Error:", err.message);
+            console.error("❌ Gemini WS Error:", err.message);
             cleanup();
-
             if (clientWs.readyState === WebSocket.OPEN) {
-                clientWs.send(JSON.stringify({
-                    error: "Error communicating with Gemini.",
-                    details: err.message
-                }));
+                clientWs.send(JSON.stringify({ error: "Error communicating with Gemini.", details: err.message }));
             }
         });
 
-        geminiWs.on('pong', () => {
-            // Pong received — connection healthy
-        });
+        geminiWs.on('pong', () => { /* connection healthy */ });
 
     } catch (e) {
         console.error("Failed to connect to Gemini", e);
         cleanup();
     }
 
-    // ── Relay all messages from frontend → Gemini ─────────────────────────
+    // ── Relay all messages from frontend → Gemini ───────────────────────────
     clientWs.on('message', (message) => {
         try {
+            const text = message.toString();
+            const parsed = JSON.parse(text);
+
+            // Log what frontend is sending (skip verbose audio chunks)
+            if (!parsed.realtimeInput?.mediaChunks) {
+                console.log("📤 Frontend → Gemini:", text.substring(0, 200));
+            }
+
             if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
-                geminiWs.send(message.toString());
+                geminiWs.send(text);
             }
         } catch (e) {
             console.error("Error forwarding message to Gemini:", e.message);
