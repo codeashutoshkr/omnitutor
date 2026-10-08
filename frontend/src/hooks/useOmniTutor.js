@@ -17,6 +17,7 @@ export function useOmniTutor() {
   const [isMicActive, setIsMicActive]           = useState(false);
   const [agentSpeaking, setAgentSpeaking]       = useState(false);
   const [userSpeaking, setUserSpeaking]         = useState(false);
+  const [isThinking, setIsThinking]             = useState(false);
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [audioLevel, setAudioLevel]             = useState(0);
 
@@ -34,6 +35,7 @@ export function useOmniTutor() {
   const agentSpeakingRef           = useRef(false);
   const reconnectAttemptsRef       = useRef(0);
   const reconnectTimerRef          = useRef(null);
+  const thinkingTimeoutRef         = useRef(null);
   const userInitiatedDisconnectRef = useRef(false);
   const userSpeakingRef            = useRef(false);
 
@@ -60,11 +62,14 @@ export function useOmniTutor() {
     nextPlaybackTimeRef.current = 0;
     agentSpeakingRef.current = false;
     setAgentSpeaking(false);
+    setIsThinking(false);
+    if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
   }, []);
 
   // ─── Stop all media streams ────────────────────────────────────────────────
   const stopMediaStreams = useCallback(() => {
     if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+    if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
     if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop());
     if (audioStreamRef.current) audioStreamRef.current.getTracks().forEach(t => t.stop());
     if (recordingAudioContextRef.current) {
@@ -77,6 +82,7 @@ export function useOmniTutor() {
     setIsMicActive(false);
     setIsScreenSharing(false);
     setUserSpeaking(false);
+    setIsThinking(false);
     userSpeakingRef.current = false;
     setAudioLevel(0);
   }, []);
@@ -109,6 +115,7 @@ export function useOmniTutor() {
         if (scheduledSourcesRef.current.length === 0) {
           agentSpeakingRef.current = false;
           setAgentSpeaking(false);
+          setIsThinking(false);
         }
       };
 
@@ -134,21 +141,31 @@ export function useOmniTutor() {
 
     if (response.error) {
       console.error('❌ Error from backend/Gemini:', JSON.stringify(response));
+      setIsThinking(false);
+      if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
       return;
     }
 
     if (response.serverContent?.interrupted) {
       stopAgentAudio();
+      setIsThinking(false);
+      if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
       return;
     }
 
     if (response.serverContent?.turnComplete) {
       agentSpeakingRef.current = false;
       setAgentSpeaking(false);
+      setIsThinking(false);
+      if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
       return;
     }
 
     if (response.serverContent?.modelTurn?.parts) {
+      // First part arrived — stop thinking, agent is now responding
+      setIsThinking(false);
+      if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
+
       const parts = response.serverContent.modelTurn.parts;
       for (const part of parts) {
         if (part.inlineData?.data) {
@@ -249,12 +266,18 @@ export function useOmniTutor() {
         return;
       }
 
+      // If agent is speaking, interrupt it
+      stopAgentAudio();
+      setIsThinking(false);
+      if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           noiseSuppression: true,
           echoCancellation: true,
           autoGainControl:  true,
           channelCount:     1,
+          sampleRate:       16000,
         }
       });
 
@@ -327,12 +350,63 @@ export function useOmniTutor() {
         }
       };
 
-      console.log('🎤 Mic streaming — Gemini built-in VAD handling turns automatically');
+      console.log('🎤 Mic ON — listening to user');
     } catch (err) {
       console.error('Failed to start mic:', err);
       setIsMicActive(false);
     }
   }, [isMicActive, stopAgentAudio]);
+
+  // ─── Stop Microphone & Signal Turn Complete ────────────────────────────────
+  const stopMic = useCallback(() => {
+    // 1. Send silent PCM buffer frames to cleanly trigger Gemini's built-in VAD
+    // Note: Do NOT send clientContent { turnComplete: true } here, as Gemini Bidi
+    // rejects empty clientContent with 1007 "Request contains an invalid argument".
+    // Sending trailing silence is the standard way Gemini VAD detects utterance completion.
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      try {
+        const silenceChunk = new Int16Array(2048); // 128ms of clean 16kHz silence
+        const silenceBase64 = arrayBufferToBase64(silenceChunk.buffer);
+        for (let i = 0; i < 4; i++) {
+          wsRef.current.send(JSON.stringify({
+            realtimeInput: {
+              mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: silenceBase64 }]
+            }
+          }));
+        }
+        console.log('⏹ Mic stopped → Trailing silence sent, awaiting Gemini response');
+      } catch (err) {
+        console.error('Error sending trailing silence:', err);
+      }
+    }
+
+    // 2. Shut down microphone hardware tracks immediately
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(t => t.stop());
+      audioStreamRef.current = null;
+    }
+
+    // 3. Clean up recording audio context
+    if (recordingAudioContextRef.current) {
+      recordingAudioContextRef.current.close().catch(() => {});
+      recordingAudioContextRef.current = null;
+    }
+
+    workletLoadedRef.current = false;
+    vadSpeechFrameCountRef.current = 0;
+    vadSilentFrameCountRef.current = 0;
+    userSpeakingRef.current = false;
+    setUserSpeaking(false);
+    setAudioLevel(0);
+    setIsMicActive(false);
+
+    // 4. Enter thinking state — agent is now processing & analyzing
+    setIsThinking(true);
+    if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
+    thinkingTimeoutRef.current = setTimeout(() => {
+      setIsThinking(false);
+    }, 15000);
+  }, []);
 
   // ─── Screen Sharing ────────────────────────────────────────────────────────
   const startScreenShare = useCallback(async () => {
@@ -390,12 +464,14 @@ export function useOmniTutor() {
     isMicActive,
     agentSpeaking,
     userSpeaking,
+    isThinking,
     reconnectAttempt,
     audioLevel,
     videoRef,
     connect,
     disconnect,
     startMic,
+    stopMic,
     startScreenShare,
   };
 }

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Video, Mic, MonitorUp, Wifi, WifiOff, CloudUpload, MicOff, RefreshCw, Activity } from 'lucide-react';
 import { useOmniTutor } from './hooks/useOmniTutor';
 
@@ -9,16 +9,36 @@ function App() {
     isMicActive,
     agentSpeaking,
     userSpeaking,
+    isThinking,
     reconnectAttempt,
     audioLevel,
     videoRef,
     connect,
     disconnect,
     startMic,
+    stopMic,
     startScreenShare,
   } = useOmniTutor();
 
   const [uploadStatus, setUploadStatus] = useState('');
+  const [thinkingIndex, setThinkingIndex] = useState(0);
+
+  const thinkingSteps = [
+    { title: 'OmniTutor is thinking…', sub: 'Analyzing your question…' },
+    { title: 'Processing your voice…', sub: 'Synthesizing knowledge…' },
+    { title: 'Preparing response…', sub: 'Almost ready to speak…' },
+  ];
+
+  useEffect(() => {
+    if (!isThinking) {
+      setThinkingIndex(0);
+      return;
+    }
+    const timer = setInterval(() => {
+      setThinkingIndex(prev => (prev + 1) % thinkingSteps.length);
+    }, 1800);
+    return () => clearInterval(timer);
+  }, [isThinking]);
 
   const handleSnapshot = async () => {
     if (!isScreenSharing || !videoRef.current || videoRef.current.readyState < 2) return;
@@ -49,27 +69,33 @@ function App() {
     }
   };
 
-  /* ── Derive agent orb state ────────────────────────────────────────────── */
+  /* ── Derive orb state ───────────────────────────────────────────────────── */
   const orbState = !isConnected
     ? 'offline'
-    : userSpeaking
-      ? 'user-speaking'
-      : agentSpeaking
-        ? 'agent-speaking'
-        : 'listening';
+    : isMicActive
+      ? userSpeaking ? 'user-speaking' : 'listening'
+      : isThinking
+        ? 'thinking'
+        : agentSpeaking
+          ? 'agent-speaking'
+          : 'idle';
 
   const statusLabel = {
     offline:          'Agent Offline',
-    listening:        'Listening…',
-    'user-speaking':  'Hearing you…',
+    idle:             'Ready',
+    listening:        'Listening to you…',
+    'user-speaking':  'Receiving your voice…',
+    thinking:         thinkingSteps[thinkingIndex].title,
     'agent-speaking': 'OmniTutor is speaking…',
   }[orbState];
 
   const statusSub = {
     offline:          'Connect to start a tutoring session',
-    listening:        'Ready — just start talking naturally',
-    'user-speaking':  'Keep talking, you can interrupt anytime',
-    'agent-speaking': 'Speak to interrupt at any time',
+    idle:             'Click the mic or orb to ask a question',
+    listening:        'Speak your question — tap when finished',
+    'user-speaking':  'Hearing you clearly — tap when finished',
+    thinking:         thinkingSteps[thinkingIndex].sub,
+    'agent-speaking': 'Tap mic to interrupt at any time',
   }[orbState];
 
   // Audio level bar: 0-100% mapped from RMS 0-0.3
@@ -406,34 +432,53 @@ function App() {
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
 
-              {/* Microphone */}
+              {/* Microphone toggle */}
               <button
                 id="btn-microphone"
-                onClick={startMic}
-                disabled={isMicActive}
-                className={`device-btn${isMicActive ? ' active' : ''}`}
+                onClick={isMicActive ? stopMic : startMic}
+                disabled={!isConnected}
+                className={`device-btn${isMicActive ? ' active' : ''}${isThinking ? ' thinking' : ''}`}
+                title={isMicActive ? 'Click to finish speaking and send' : isThinking ? 'OmniTutor is thinking' : 'Click to speak'}
               >
                 <div className="device-btn-left">
                   <div className="device-icon">
                     {isMicActive ? <Mic size={15} /> : <MicOff size={15} />}
                   </div>
-                  <span className="device-label">Microphone</span>
+                  <div>
+                    <span className="device-label">Microphone</span>
+                    <div className="device-status">
+                      {isMicActive
+                        ? (userSpeaking ? 'Receiving voice… tap to finish' : 'Listening… tap to finish')
+                        : isThinking
+                        ? 'Thinking & analyzing…'
+                        : agentSpeaking
+                        ? 'OmniTutor speaking'
+                        : 'Tap to speak'}
+                    </div>
+                  </div>
                 </div>
 
                 <div className="viz-bars">
-                  {isMicActive
-                    ? [1,2,3,4,5].map(i => (
-                        <div
-                          key={i}
-                          className={`viz-bar ${userSpeaking ? 'active' : 'inactive'}`}
-                          style={userSpeaking ? {
-                            animationDelay: `${i * 0.09}s`,
-                            height: `${8 + i * 2}px`
-                          } : {}}
-                        />
-                      ))
-                    : <span className="device-status">Off</span>
-                  }
+                  {isMicActive ? (
+                    [1,2,3,4,5].map(i => (
+                      <div
+                        key={i}
+                        className={`viz-bar ${userSpeaking ? 'active' : 'inactive'}`}
+                        style={userSpeaking ? {
+                          animationDelay: `${i * 0.09}s`,
+                          height: `${8 + i * 2}px`
+                        } : {}}
+                      />
+                    ))
+                  ) : isThinking ? (
+                    <div className="thinking-mini-bars">
+                      <span className="mini-dot dot-1" />
+                      <span className="mini-dot dot-2" />
+                      <span className="mini-dot dot-3" />
+                    </div>
+                  ) : (
+                    <span className="device-status">Off</span>
+                  )}
                 </div>
               </button>
 
@@ -476,18 +521,20 @@ function App() {
               </span>
             </div>
 
-            {/* VAD state */}
+            {/* Voice state */}
             <div className="health-row">
               <span className="health-label">
                 <span className={`health-dot ${
-                  agentSpeaking ? 'dot-green'
-                    : userSpeaking ? 'dot-yellow'
-                    : 'dot-red'
-                }`} style={{ background: agentSpeaking ? '#6366f1' : undefined, boxShadow: agentSpeaking ? '0 0 6px #6366f1' : undefined }} />
+                  agentSpeaking ? 'dot-indigo'
+                    : isThinking ? 'dot-purple'
+                    : userSpeaking ? 'dot-blue'
+                    : isMicActive ? 'dot-yellow'
+                    : 'dot-gray'
+                }`} />
                 Voice State
               </span>
-              <span style={{ fontSize: 12, color: '#94a3b8' }}>
-                {agentSpeaking ? 'Agent speaking' : userSpeaking ? 'You speaking' : 'Silent'}
+              <span style={{ fontSize: 12, color: agentSpeaking ? '#818cf8' : isThinking ? '#c084fc' : userSpeaking ? '#60a5fa' : isMicActive ? '#facc15' : '#94a3b8' }}>
+                {agentSpeaking ? 'Agent speaking' : isThinking ? 'Thinking & analyzing' : userSpeaking ? 'Receiving voice' : isMicActive ? 'Listening' : 'Silent'}
               </span>
             </div>
 
@@ -522,52 +569,173 @@ function App() {
             )}
           </div>
 
-          {/* Agent Orb */}
+          {/* Tap-to-Speak Orb Panel with Interactive Visuals */}
           <div className="orb-panel">
-            <div className="orb-wrap">
-              {/* Rings */}
-              {orbState === 'agent-speaking' && (
+
+            {/* Visual 3-Step Workflow Guide */}
+            <div className="flow-guide">
+              <span className={`flow-step ${!isMicActive && !isThinking && !agentSpeaking ? 'active' : 'done'}`}>
+                1. Open Mic
+              </span>
+              <span className="flow-arrow">→</span>
+              <span className={`flow-step ${isMicActive ? 'active' : isThinking || agentSpeaking ? 'done' : ''}`}>
+                2. Speak
+              </span>
+              <span className="flow-arrow">→</span>
+              <span className={`flow-step ${isThinking ? 'active' : agentSpeaking ? 'done' : ''}`}>
+                3. AI Answers
+              </span>
+            </div>
+
+            {/* Primary Interactive Clickable Orb */}
+            <button
+              className={`orb-btn ${
+                !isConnected        ? 'orb-btn-offline'       :
+                isMicActive         ? (userSpeaking ? 'orb-btn-speaking-active' : 'orb-btn-recording') :
+                isThinking          ? 'orb-btn-thinking'      :
+                agentSpeaking       ? 'orb-btn-agent'         :
+                                      'orb-btn-idle'
+              }`}
+              onClick={
+                !isConnected ? undefined :
+                isMicActive  ? stopMic   :
+                               startMic
+              }
+              disabled={!isConnected}
+              title={
+                !isConnected ? 'Connect agent first' :
+                isMicActive  ? 'Click to finish speaking and send' :
+                isThinking   ? 'OmniTutor is thinking…' :
+                'Click to speak'
+              }
+            >
+              {/* Outer pulsing / rotating rings */}
+              {isMicActive && (
                 <>
-                  <div className="orb-ring ring-agent" />
-                  <div className="orb-ring ring-agent-outer" />
+                  <span className="orb-ring-pulse" />
+                  {userSpeaking && <span className="orb-ring-pulse-outer" />}
                 </>
               )}
-              {orbState === 'user-speaking' && (
-                <div className="orb-ring ring-user" />
+              {isThinking && (
+                <>
+                  <span className="orb-ring-thinking-spin" />
+                  <span className="orb-ring-thinking-pulse" />
+                </>
               )}
-              {orbState === 'listening' && (
-                <div className="orb-ring ring-listen" />
+              {agentSpeaking && !isMicActive && (
+                <>
+                  <span className="orb-ring-agent" />
+                  <span className="orb-ring-agent-outer" />
+                </>
               )}
 
-              {/* Core */}
-              <div className={`orb-core ${
-                orbState === 'offline'          ? 'orb-offline'   :
-                orbState === 'agent-speaking'   ? 'orb-agent'     :
-                orbState === 'user-speaking'    ? 'orb-user'      :
-                                                  'orb-listening'
-              }`}>
-                {orbState === 'agent-speaking' && (
-                  <div className="orb-bars">
+              {/* Center icon & interactive visualizer */}
+              {isThinking ? (
+                <div className="thinking-dots" title="Analyzing...">
+                  <span className="thinking-dot dot-1" />
+                  <span className="thinking-dot dot-2" />
+                  <span className="thinking-dot dot-3" />
+                </div>
+              ) : agentSpeaking && !isMicActive ? (
+                <div className="orb-bars">
+                  {[1,2,3,4,5].map(i => (
+                    <div
+                      key={i}
+                      className="orb-bar"
+                      style={{
+                        animation: `audioBar 0.45s ease-in-out infinite alternate`,
+                        animationDelay: `${i * 0.12}s`
+                      }}
+                    />
+                  ))}
+                </div>
+              ) : isMicActive ? (
+                userSpeaking ? (
+                  <div className="orb-bars live-bars">
                     {[1,2,3,4,5].map(i => (
                       <div
                         key={i}
-                        className="orb-bar"
+                        className="orb-bar user-live-bar"
                         style={{
-                          animation: `audioBar 0.5s ease-in-out infinite alternate`,
-                          animationDelay: `${i * 0.13}s`
+                          height: `${Math.max(6, Math.min(26, Math.round((audioLevel / 0.18) * 20) + (i % 2 === 0 ? 5 : 9)))}px`
                         }}
                       />
                     ))}
                   </div>
-                )}
-                {orbState === 'user-speaking' && <Mic size={20} color="white" />}
-              </div>
-            </div>
+                ) : (
+                  <MicOff size={28} color="white" />
+                )
+              ) : (
+                <Mic size={28} color={isConnected ? 'white' : '#475569'} />
+              )}
+            </button>
 
-            <div>
+            {/* Dynamic Status Text & Subtitle */}
+            <div style={{ textAlign: 'center', minHeight: 46 }}>
               <p className="orb-status-title">{statusLabel}</p>
               <p className="orb-status-sub">{statusSub}</p>
             </div>
+
+            {/* Main Action Button for Instant Usability */}
+            <button
+              className={`main-action-btn ${
+                !isConnected ? 'btn-action-offline' :
+                isMicActive  ? 'btn-action-send' :
+                isThinking   ? 'btn-action-thinking' :
+                agentSpeaking ? 'btn-action-interrupt' :
+                'btn-action-speak'
+              }`}
+              onClick={
+                !isConnected ? connect :
+                isMicActive  ? stopMic :
+                startMic
+              }
+              disabled={isThinking}
+            >
+              {!isConnected ? (
+                <>Connect Agent to Start</>
+              ) : isMicActive ? (
+                <>
+                  <span className="action-icon-pulse">⏹</span>
+                  Finish Speaking & Ask AI
+                </>
+              ) : isThinking ? (
+                <>
+                  <span className="action-spinner">✦</span>
+                  Analyzing Your Question…
+                </>
+              ) : agentSpeaking ? (
+                <>
+                  <span>✋</span>
+                  Interrupt & Speak
+                </>
+              ) : (
+                <>
+                  <Mic size={16} />
+                  Tap to Speak
+                </>
+              )}
+            </button>
+
+            {/* Interactive Status Pill Badges */}
+            {isMicActive && (
+              <div className="rec-pill">
+                <span className="rec-dot" />
+                {userSpeaking ? 'RECEIVING VOICE • TAP TO SEND' : 'MIC OPEN • SPEAK NOW'}
+              </div>
+            )}
+            {isThinking && (
+              <div className="thinking-pill">
+                <span className="thinking-sparkle">✦</span>
+                ANALYZING & THINKING…
+              </div>
+            )}
+            {agentSpeaking && (
+              <div className="speaking-pill">
+                <span className="speaking-wave">●</span>
+                AI RESPONDING • TAP TO INTERRUPT
+              </div>
+            )}
           </div>
 
         </div>
@@ -575,9 +743,302 @@ function App() {
 
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ── Tap-to-Speak Orb Button ── */
+        .orb-btn {
+          position: relative;
+          width: 96px; height: 96px;
+          border-radius: 50%;
+          border: none;
+          cursor: pointer;
+          display: flex; align-items: center; justify-content: center;
+          transition: transform 0.2s, box-shadow 0.2s;
+          outline: none;
+          flex-shrink: 0;
+        }
+        .orb-btn:active { transform: scale(0.93); }
+        .orb-btn:disabled { cursor: default; }
+
+        .orb-btn-offline {
+          background: #1e293b;
+          box-shadow: none;
+        }
+        .orb-btn-idle {
+          background: linear-gradient(135deg, #334155, #1e293b);
+          box-shadow: 0 0 0 1px rgba(255,255,255,0.07);
+        }
+        .orb-btn-idle:hover:not(:disabled) {
+          background: linear-gradient(135deg, #475569, #334155);
+          box-shadow: 0 0 28px rgba(99,102,241,0.35);
+          transform: scale(1.04);
+        }
+        .orb-btn-recording {
+          background: linear-gradient(135deg, #3b82f6, #2563eb);
+          box-shadow: 0 0 32px rgba(59,130,246,0.55);
+          animation: recPulse 1.6s ease-in-out infinite;
+        }
+        .orb-btn-speaking-active {
+          background: linear-gradient(135deg, #2563eb, #1d4ed8);
+          box-shadow: 0 0 42px rgba(37,99,235,0.75);
+          animation: recPulse 1s ease-in-out infinite;
+        }
+        .orb-btn-thinking {
+          background: linear-gradient(135deg, #4f46e5, #9333ea, #ec4899, #06b6d4);
+          background-size: 300% 300%;
+          animation: auroraShift 3s ease infinite, thinkingPulse 1.8s ease-in-out infinite alternate;
+        }
+        .orb-btn-agent {
+          background: linear-gradient(135deg, #6366f1, #818cf8);
+          box-shadow: 0 0 36px rgba(99,102,241,0.5);
+        }
+
+        @keyframes auroraShift {
+          0%   { background-position: 0% 50%; }
+          50%  { background-position: 100% 50%; }
+          100% { background-position: 0% 50%; }
+        }
+
+        @keyframes thinkingPulse {
+          0%   { box-shadow: 0 0 22px rgba(147,51,234,0.4), 0 0 44px rgba(79,70,229,0.2); transform: scale(1); }
+          100% { box-shadow: 0 0 36px rgba(236,72,153,0.6), 0 0 65px rgba(6,182,212,0.35); transform: scale(1.04); }
+        }
+
+        @keyframes recPulse {
+          0%, 100% { box-shadow: 0 0 24px rgba(59,130,246,0.5); }
+          50%       { box-shadow: 0 0 48px rgba(59,130,246,0.85); }
+        }
+
+        /* Animated rings around orb */
+        .orb-ring-pulse, .orb-ring-agent {
+          position: absolute;
+          inset: -8px;
+          border-radius: 50%;
+          border: 2px solid;
+          animation: ping 1.1s cubic-bezier(0,0,0.2,1) infinite;
+          pointer-events: none;
+        }
+        .orb-ring-pulse { border-color: rgba(59,130,246,0.5); }
+        .orb-ring-pulse-outer {
+          position: absolute;
+          inset: -14px;
+          border-radius: 50%;
+          border: 1px solid rgba(59,130,246,0.3);
+          animation: ping 1.3s cubic-bezier(0,0,0.2,1) infinite 0.2s;
+          pointer-events: none;
+        }
+        .orb-ring-thinking-spin {
+          position: absolute;
+          inset: -9px;
+          border-radius: 50%;
+          border: 2px dashed rgba(168,85,247,0.7);
+          animation: spin 3.5s linear infinite;
+          pointer-events: none;
+        }
+        .orb-ring-thinking-pulse {
+          position: absolute;
+          inset: -14px;
+          border-radius: 50%;
+          border: 1px solid rgba(236,72,153,0.35);
+          animation: ping 1.5s cubic-bezier(0,0,0.2,1) infinite;
+          pointer-events: none;
+        }
+        .orb-ring-agent { border-color: rgba(99,102,241,0.5); }
+        .orb-ring-agent-outer {
+          position: absolute;
+          inset: -15px;
+          border-radius: 50%;
+          border: 1px solid rgba(99,102,241,0.25);
+          animation: ping 1.3s cubic-bezier(0,0,0.2,1) infinite 0.3s;
+          pointer-events: none;
+        }
+
+        /* Thinking dots inside orb */
+        .thinking-dots {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .thinking-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          background: #ffffff;
+          animation: thinkingBounce 1.2s ease-in-out infinite;
+        }
+        .dot-1 { animation-delay: 0s; }
+        .dot-2 { animation-delay: 0.2s; }
+        .dot-3 { animation-delay: 0.4s; }
+        @keyframes thinkingBounce {
+          0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+          40% { transform: scale(1.2); opacity: 1; }
+        }
+
+        /* User live audio bar animation */
+        .user-live-bar {
+          background: #ffffff !important;
+          transition: height 0.05s ease-out;
+        }
+
+        /* Status Pills */
+        .rec-pill {
+          display: flex; align-items: center; gap: 6px;
+          padding: 4px 12px; border-radius: 20px;
+          background: rgba(239,68,68,0.15);
+          border: 1px solid rgba(239,68,68,0.3);
+          color: #f87171; font-size: 11px; font-weight: 700;
+          letter-spacing: 0.05em;
+        }
+        .rec-dot {
+          width: 7px; height: 7px; border-radius: 50%;
+          background: #ef4444;
+          animation: pulse 1s ease-in-out infinite;
+        }
+
+        .thinking-pill {
+          display: flex; align-items: center; gap: 6px;
+          padding: 4px 12px; border-radius: 20px;
+          background: rgba(168,85,247,0.15);
+          border: 1px solid rgba(168,85,247,0.35);
+          color: #c084fc; font-size: 11px; font-weight: 700;
+          letter-spacing: 0.05em;
+          animation: pulse 1.8s ease-in-out infinite;
+        }
+        .thinking-sparkle {
+          color: #f472b6;
+          display: inline-block;
+          animation: spin 3s linear infinite;
+        }
+
+        .speaking-pill {
+          display: flex; align-items: center; gap: 6px;
+          padding: 4px 12px; border-radius: 20px;
+          background: rgba(99,102,241,0.15);
+          border: 1px solid rgba(99,102,241,0.35);
+          color: #a5b4fc; font-size: 11px; font-weight: 700;
+          letter-spacing: 0.05em;
+        }
+        .speaking-wave {
+          color: #818cf8;
+          animation: pulse 0.8s ease-in-out infinite;
+        }
+
+        /* Thinking mini bars in sidebar */
+        .thinking-mini-bars {
+          display: flex;
+          align-items: center;
+          gap: 3px;
+        }
+        .mini-dot {
+          width: 3px;
+          height: 3px;
+          border-radius: 50%;
+          background: #c084fc;
+          animation: thinkingBounce 1s ease-in-out infinite;
+        }
+
+        .dot-indigo { background: #6366f1; box-shadow: 0 0 6px #6366f1; }
+        .dot-purple { background: #c084fc; box-shadow: 0 0 6px #c084fc; animation: pulse 1s infinite; }
+        .dot-blue   { background: #3b82f6; box-shadow: 0 0 6px #3b82f6; }
+        .dot-gray   { background: #475569; }
+
+        /* ── 3-Step Flow Guide ── */
+        .flow-guide {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          padding: 5px 12px;
+          border-radius: 12px;
+          background: rgba(255, 255, 255, 0.03);
+          border: 1px solid var(--border);
+          font-size: 11px;
+          color: var(--text-3);
+          margin-bottom: 4px;
+        }
+        .flow-step {
+          padding: 2px 7px;
+          border-radius: 6px;
+          transition: all 0.2s;
+        }
+        .flow-step.active {
+          background: rgba(99, 102, 241, 0.22);
+          color: #a5b4fc;
+          font-weight: 600;
+        }
+        .flow-step.done {
+          color: var(--emerald);
+        }
+        .flow-arrow {
+          color: var(--text-3);
+          font-size: 10px;
+        }
+
+        /* ── Main Action Button ── */
+        .main-action-btn {
+          width: 100%;
+          max-width: 250px;
+          padding: 10px 18px;
+          border-radius: 14px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          border: 1px solid transparent;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+          font-family: inherit;
+        }
+        .btn-action-speak {
+          background: linear-gradient(135deg, rgba(99, 102, 241, 0.9), rgba(129, 140, 248, 0.9));
+          color: white;
+          box-shadow: 0 4px 18px rgba(99, 102, 241, 0.4);
+        }
+        .btn-action-speak:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 6px 26px rgba(99, 102, 241, 0.6);
+        }
+        .btn-action-send {
+          background: linear-gradient(135deg, #ef4444, #dc2626);
+          color: white;
+          box-shadow: 0 4px 22px rgba(239, 68, 68, 0.45);
+          animation: pulse 1.6s ease-in-out infinite;
+        }
+        .btn-action-send:hover {
+          background: linear-gradient(135deg, #f87171, #ef4444);
+          transform: translateY(-1px);
+          box-shadow: 0 6px 28px rgba(239, 68, 68, 0.65);
+        }
+        .btn-action-thinking {
+          background: rgba(168, 85, 247, 0.15);
+          color: #c084fc;
+          border-color: rgba(168, 85, 247, 0.35);
+          cursor: wait;
+        }
+        .btn-action-interrupt {
+          background: rgba(244, 63, 94, 0.12);
+          color: #fb7185;
+          border-color: rgba(244, 63, 94, 0.3);
+        }
+        .btn-action-interrupt:hover {
+          background: rgba(244, 63, 94, 0.2);
+        }
+        .btn-action-offline {
+          background: rgba(255, 255, 255, 0.05);
+          color: var(--text-2);
+          border-color: var(--border);
+        }
+        .action-icon-pulse {
+          display: inline-block;
+          animation: pulse 1s infinite;
+        }
+        .action-spinner {
+          display: inline-block;
+          animation: spin 2.5s linear infinite;
+        }
       `}</style>
     </div>
   );
 }
 
-export default App;
+export default App;
